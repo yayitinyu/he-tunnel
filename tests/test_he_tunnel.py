@@ -28,6 +28,17 @@ class TunnelTests(unittest.TestCase):
         self.assertEqual(config["client_ipv6"], "2001:470:ffff:81c::2/64")
         self.assertEqual(config["local_ipv4"], "8.8.8.8")
 
+    def test_tunnel_endpoint_without_routed_prefix(self):
+        config = he_tunnel.parse_config({key: value for key, value in HE_VALUES.items()
+                                         if key != "routed_prefix"})
+        self.assertIsNone(config["routed_prefix"])
+        self.assertIsNone(config["routed_address"])
+
+    def test_routed_56_derives_single_host_address(self):
+        config = he_tunnel.parse_config({**HE_VALUES,
+                                         "routed_prefix": "2001:470:fffe:8100::/56"})
+        self.assertEqual(config["routed_address"], "2001:470:fffe:8100::1")
+
     def test_nat_mapping_uses_private_local_ipv4(self):
         config = he_tunnel.parse_config({**HE_VALUES, "client_ipv4": "9.9.9.9",
                                          "local_ipv4": "172.16.10.20"})
@@ -83,6 +94,22 @@ class TunnelTests(unittest.TestCase):
              "dev", "he-ipv6", "metric", "2048"),
             [call.args for call in run_mock.call_args_list],
         )
+
+    @patch.object(he_tunnel, "require_root")
+    @patch.object(he_tunnel, "require_commands")
+    @patch.object(he_tunnel, "check_local_ipv4")
+    @patch.object(he_tunnel, "interface_exists", return_value=False)
+    @patch.object(he_tunnel, "existing_default_route", return_value=False)
+    @patch.object(he_tunnel, "run", return_value=result())
+    def test_no_routed_prefix_adds_only_endpoint_address(self, run_mock, *_):
+        config = he_tunnel.parse_config({key: value for key, value in HE_VALUES.items()
+                                         if key != "routed_prefix"})
+        he_tunnel.tunnel_up(config)
+        address_commands = [call.args for call in run_mock.call_args_list
+                            if call.args[:4] == ("ip", "-6", "addr", "add")]
+        self.assertEqual(address_commands, [
+            ("ip", "-6", "addr", "add", config["client_ipv6"], "dev", "he-ipv6")
+        ])
 
     @patch.object(he_tunnel, "require_root")
     @patch.object(he_tunnel, "require_commands")

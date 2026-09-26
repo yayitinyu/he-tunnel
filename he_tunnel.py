@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Configure a Hurricane Electric 6in4 tunnel on a systemd Linux host."""
+"""Configure a SIT (6in4) IPv6 tunnel on a systemd Linux host."""
 
 import argparse
 import ipaddress
@@ -54,25 +54,26 @@ def parse_config(values):
         local_v4 = ipaddress.IPv4Address(values.get("local_ipv4") or values["client_ipv4"])
         server_v6 = ipaddress.IPv6Interface(values["server_ipv6"])
         client_v6 = ipaddress.IPv6Interface(values["client_ipv6"])
-        routed = ipaddress.IPv6Network(values["routed_prefix"], strict=True)
+        routed_value = values.get("routed_prefix")
+        routed = ipaddress.IPv6Network(routed_value, strict=True) if routed_value else None
         route_policy = values["default_route"]
     except (ValueError, KeyError) as exc:
-        raise TunnelError(f"Invalid HE address or prefix: {exc}") from exc
+        raise TunnelError(f"Invalid tunnel address or prefix: {exc}") from exc
 
     if not (server_v4.is_global and client_v4.is_global):
-        raise TunnelError("The HE server and client IPv4 addresses must be public addresses.")
+        raise TunnelError("The server and client IPv4 addresses must be public addresses.")
     if server_v4 == client_v4:
-        raise TunnelError("The HE server and client IPv4 addresses must differ.")
+        raise TunnelError("The server and client IPv4 addresses must differ.")
     if local_v4.is_loopback or local_v4.is_link_local or local_v4.is_multicast or local_v4.is_unspecified:
         raise TunnelError("The local IPv4 address must be a usable host address.")
     if server_v6.network.prefixlen != 64 or client_v6.network.prefixlen != 64:
-        raise TunnelError("The HE endpoint IPv6 addresses must include /64.")
+        raise TunnelError("The endpoint IPv6 addresses must include /64.")
     if server_v6.network != client_v6.network or server_v6.ip == client_v6.ip:
-        raise TunnelError("The HE IPv6 endpoints must be different addresses in the same /64.")
-    if routed.prefixlen != 64 or routed == client_v6.network:
-        raise TunnelError("The routed prefix must be a separate /64.")
-    if not (server_v6.ip.is_global and client_v6.ip.is_global and routed.is_global):
-        raise TunnelError("The HE IPv6 endpoints and routed prefix must be global addresses.")
+        raise TunnelError("The IPv6 endpoints must be different addresses in the same /64.")
+    if routed and (not 48 <= routed.prefixlen <= 64 or routed.overlaps(client_v6.network)):
+        raise TunnelError("The routed prefix must be a separate IPv6 /48 to /64.")
+    if not (server_v6.ip.is_global and client_v6.ip.is_global) or (routed and not routed.is_global):
+        raise TunnelError("The IPv6 endpoints and routed prefix must be global addresses.")
     if route_policy not in ("auto", "yes", "no"):
         raise TunnelError("default_route must be auto, yes, or no.")
 
@@ -82,8 +83,8 @@ def parse_config(values):
         "local_ipv4": str(local_v4),
         "server_ipv6": str(server_v6),
         "client_ipv6": str(client_v6),
-        "routed_prefix": str(routed),
-        "routed_address": str(routed.network_address + 1),
+        "routed_prefix": str(routed) if routed else None,
+        "routed_address": str(routed.network_address + 1) if routed else None,
         "default_route": route_policy,
     }
 
@@ -105,7 +106,7 @@ def check_local_ipv4(config):
         )
     route = run("ip", "-4", "route", "get", config["server_ipv4"])
     if not re.search(rf"\bsrc {re.escape(config['local_ipv4'])}\b", route.stdout):
-        raise TunnelError("The IPv4 route to the HE server does not use the configured local IPv4.")
+        raise TunnelError("The IPv4 route to the tunnel server does not use the configured local IPv4.")
 
 
 def interface_exists():
@@ -128,7 +129,8 @@ def tunnel_up(config):
     try:
         run("ip", "link", "set", "dev", INTERFACE, "mtu", "1480", "up")
         run("ip", "-6", "addr", "add", config["client_ipv6"], "dev", INTERFACE)
-        run("ip", "-6", "addr", "add", f"{config['routed_address']}/128", "dev", INTERFACE)
+        if config["routed_address"]:
+            run("ip", "-6", "addr", "add", f"{config['routed_address']}/128", "dev", INTERFACE)
         if config["default_route"] == "yes" or (
             config["default_route"] == "auto" and not existing_default_route()
         ):
@@ -152,7 +154,7 @@ def tunnel_down(config):
     if not ("ipv6/ip" in details and
             re.search(rf"\bremote {re.escape(config['server_ipv4'])}\b", details) and
             re.search(rf"\blocal {re.escape(config['local_ipv4'])}\b", details)):
-        raise TunnelError(f"Interface {INTERFACE} does not match this HE tunnel; refusing to delete it.")
+        raise TunnelError(f"Interface {INTERFACE} does not match this tunnel; refusing to delete it.")
     run("ip", "tunnel", "del", INTERFACE)
 
 
@@ -186,7 +188,7 @@ def install(config):
         raise TunnelError(f"Interface {INTERFACE} already exists; refusing to replace it.")
 
     unit = """[Unit]
-Description=Hurricane Electric IPv6 tunnel
+Description=IPv6 SIT tunnel
 Wants=network-online.target
 After=network-online.target
 
@@ -246,10 +248,10 @@ def build_parser():
         command = subparsers.add_parser(name, help=f"{name} the tunnel configuration")
         command.add_argument("--server-ipv4", required=True)
         command.add_argument("--client-ipv4", required=True)
-        command.add_argument("--local-ipv4", help="IPv4 on this host, if HE's public client IPv4 is NAT mapped")
-        command.add_argument("--server-ipv6", required=True, help="HE server IPv6, including /64")
-        command.add_argument("--client-ipv6", required=True, help="HE client IPv6, including /64")
-        command.add_argument("--routed-prefix", required=True, help="HE routed /64")
+        command.add_argument("--local-ipv4", help="IPv4 on this host, if the public client IPv4 is NAT mapped")
+        command.add_argument("--server-ipv6", required=True, help="server IPv6, including /64")
+        command.add_argument("--client-ipv6", required=True, help="client IPv6, including /64")
+        command.add_argument("--routed-prefix", help="optional routed IPv6 /48 to /64")
         command.add_argument("--default-route", choices=("auto", "yes", "no"), default="auto")
     subparsers.add_parser("up", help="bring up the installed tunnel")
     subparsers.add_parser("down", help="remove the installed tunnel interface")
